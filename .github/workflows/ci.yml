@@ -1,0 +1,145 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default. Any job needing more declares it locally.
+permissions:
+  contents: read
+
+# A superseded run on the same ref is wasted compute. Cancel it -- except on
+# main, where every commit's result is a record worth keeping.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Note there is deliberately no UV_FROZEN here. `UV_FROZEN` and `--locked` are
+# mutually exclusive and uv rejects the pair outright rather than guessing:
+# `--frozen` means "install from the lockfile without checking it is current",
+# `--locked` means "assert the lockfile is current and fail if it would change".
+# The second is the guarantee worth having -- it turns "someone edited
+# pyproject.toml and forgot to re-lock" into a red build instead of a silent
+# install from a stale resolution.
+
+# Actions are pinned to full commit SHAs, not tags. Two reasons, both learned
+# the hard way. A tag is mutable, so `@v7` can silently become different code
+# after review. And a moving major tag is not guaranteed to exist at all:
+# astral-sh/setup-uv publishes `v9.0.0` but its moving major tags stop at `v7`,
+# so `@v9` fails to resolve and the job dies before any step runs. A SHA cannot
+# move and cannot be absent. The trailing comment carries the human-readable
+# version so `git log` stays legible.
+
+jobs:
+  # Secret scanning runs on its own and first. If a credential is in the diff,
+  # nothing else about this commit matters.
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the scan below covers every commit, not a diff range.
+          fetch-depth: 0
+
+      # Deliberately NOT gitleaks/gitleaks-action. That action derives a
+      # `<parent>..<head>` commit range, which is unrepresentable on a repo's
+      # first push -- the initial commit has no parent, so git rejects the
+      # revision, the action treats non-empty stderr as a scan failure, and CI
+      # goes red while reporting "no leaks found". Running the binary against
+      # full history is deterministic, has no range arithmetic, and removes a
+      # third-party action from the supply chain. The download is checksum
+      # verified against the release's own manifest.
+      - name: install gitleaks
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          TARBALL="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$TARBALL" "$BASE/$TARBALL"
+          curl -fsSL --retry 3 -o checksums.txt "$BASE/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " $TARBALL\$" checksums.txt | sha256sum -c -
+          tar -xzf "$TARBALL" gitleaks
+          ./gitleaks version
+
+      - name: scan full history
+        run: |
+          ./gitleaks detect \
+            --source . \
+            --config .gitleaks.toml \
+            --redact \
+            --no-banner \
+            --platform github \
+            --exit-code 1
+
+  check:
+    name: py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.13 is the floor declared in requires-python; 3.14 catches
+        # deprecations before they become breakage.
+        python: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: install
+        run: uv sync --locked --group dev
+        env:
+          UV_PYTHON: ${{ matrix.python }}
+
+      - name: lint
+        run: uv run ruff check --output-format=github .
+
+      - name: format
+        run: uv run ruff format --check .
+
+      - name: type check
+        run: uv run mypy
+
+      # No network, no credentials. If a test needs either it carries a marker
+      # and is excluded here by default.
+      - name: test
+        run: uv run pytest --cov --cov-report=term-missing
+
+  build:
+    name: build wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: build
+        run: uv build
+
+      # A src/ layout can silently produce a wheel containing no modules. This
+      # asserts the package and its typing marker actually shipped.
+      - name: verify wheel contents
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/*.whl)
+          echo "inspecting $WHEEL"
+          unzip -l "$WHEEL"
+          unzip -l "$WHEEL" | grep -q 'leadflow/__init__.py' \
+            || { echo "::error::wheel contains no leadflow package"; exit 1; }
+          unzip -l "$WHEEL" | grep -q 'leadflow/py.typed' \
+            || { echo "::error::wheel is missing the py.typed marker"; exit 1; }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

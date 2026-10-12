@@ -1,0 +1,97 @@
+[project]
+name = "leadflow-agent"
+version = "0.1.0"
+description = "A tool-using agent that turns raw inbound sales enquiries into clean HubSpot records, with an audit ledger, cost tracking and a failure-mode test suite."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sparli Aman" }]
+keywords = ["agents", "tool-use", "hubspot", "crm", "llm", "evals"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
+
+# Ranges express compatibility. Exact versions live in uv.lock, which CI
+# enforces with `uv sync --locked`.
+dependencies = [
+  "anthropic>=1.0,<2",
+  "httpx>=0.28,<0.29",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "structlog>=24.4,<26",
+  "typer>=0.15,<0.20",
+]
+
+[project.scripts]
+leadflow = "leadflow.cli:app"
+
+[project.urls]
+Repository = "https://github.com/Sparli/leadflow-agent"
+
+[dependency-groups]
+dev = [
+  "ruff>=0.9,<0.20",
+  "mypy>=1.14,<3",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6.0,<8",
+  "respx>=0.22,<0.23",
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.20"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "leadflow"
+module-root = "src"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH",
+  "RUF",
+  "S",    # bandit: this project handles untrusted text and credentials
+  "DTZ",  # naive datetimes are a correctness bug in an audit ledger
+  "T20",  # no print(): output goes through structlog or the CLI's console
+  "RET", "ERA",
+]
+ignore = [
+  "E501",  # line length is the formatter's job
+  "B008",  # typer declares options as call defaults; that is its documented idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "ARG001", "ARG002"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+enable_error_code = ["redundant-expr", "possibly-undefined", "truthy-bool", "ignore-without-code"]
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+
+# The default test run never touches the network or a paid model.
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config -m 'not live'"
+xfail_strict = true
+filterwarnings = ["error"]
+markers = [
+  "live: calls real HubSpot and Anthropic APIs. Run with -m live.",
+]
+
+[tool.coverage.run]
+source = ["src/leadflow"]
+branch = true

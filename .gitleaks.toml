@@ -1,0 +1,31 @@
+# gitleaks configuration.
+#
+# Allowlisting policy: allowlist by VALUE, never by PATH.
+#
+# A path-based allowlist (`tests/fixtures/**`) is a permanent hole -- the day a
+# real key is pasted into an allowlisted directory, the scanner stays silent.
+# Allowlisting the specific known-safe literal keeps every other secret in that
+# same file in scope.
+
+title = "leadflow-agent"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-safe literals. Each entry is a specific value, not a location."
+
+# Test fixtures use this exact sentinel wherever a credential is required. It is
+# not a valid key with any provider, and its presence in a diff is intentional.
+regexes = [
+  '''NOT-A-REAL-KEY-test-fixture-only''',
+]
+
+# The example env file must be scannable, but its values are empty by design.
+# This asserts that: if a line in .env.example ever gains a value, the scanner
+# still inspects it -- only the empty-assignment form is exempt.
+[[rules]]
+id = "env-example-must-stay-empty"
+description = "A value assigned in .env.example means a real secret may have been pasted into the template"
+regex = '''(?i)^[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*=.+$'''
+path = '''\.env\.example$'''
