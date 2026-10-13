@@ -175,3 +175,21 @@ def test_abnormal_stops_end_the_run_without_tool_calls(
 
     assert result.outcome == outcome
     assert hubspot.calls == []
+
+
+def test_api_failure_closes_the_run_as_error(ledger: Ledger) -> None:
+    def failing_model(**_: Any) -> BetaMessage:
+        raise ConnectionError("network down")
+
+    agent = Agent(
+        failing_model,
+        lambda run_id: ToolBox(FakeHubSpot(), ledger, run_id),  # type: ignore[arg-type]
+        ledger,
+        model="claude-opus-5-5",
+        max_steps=3,
+    )
+
+    with pytest.raises(ConnectionError):
+        agent.run("lead")
+
+    assert ledger.recent_runs(1)[0][2] == "error"

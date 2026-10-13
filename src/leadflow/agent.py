@@ -63,7 +63,7 @@ class Step:
 @dataclass
 class RunResult:
     run_id: str
-    outcome: str  # "completed" | "step_limit" | "refused" | "max_tokens"
+    outcome: str  # "completed" | "step_limit" | "refused" | "max_tokens" | "error"
     summary: str
     steps: list[Step] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
@@ -91,10 +91,22 @@ class Agent:
         structlog.contextvars.bind_contextvars(run_id=run_id)
         started = time.monotonic()
         self._ledger.start_run(run_id, lead_text, self._model)
-        result = self._loop(run_id, lead_text)
+        result = RunResult(run_id=run_id, outcome="step_limit", summary="")
+        try:
+            self._loop(result, lead_text)
+        except Exception:
+            # An API or network failure must still close the run in the ledger, with
+            # the tokens already spent; otherwise history shows it as running forever.
+            result.outcome = "error"
+            raise
+        finally:
+            self._finish(result, started)
+        return result
+
+    def _finish(self, result: RunResult, started: float) -> None:
         result.seconds = round(time.monotonic() - started, 2)
         self._ledger.finish_run(
-            run_id,
+            result.run_id,
             outcome=result.outcome,
             steps=len(result.steps),
             input_tokens=result.usage.input_tokens,
@@ -108,11 +120,9 @@ class Agent:
             cost_usd=round(result.usage.cost_usd, 4),
         )
         structlog.contextvars.unbind_contextvars("run_id")
-        return result
 
-    def _loop(self, run_id: str, lead_text: str) -> RunResult:
-        toolbox = self._toolbox_factory(run_id)
-        result = RunResult(run_id=run_id, outcome="step_limit", summary="")
+    def _loop(self, result: RunResult, lead_text: str) -> None:
+        toolbox = self._toolbox_factory(result.run_id)
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": f"<lead>\n{lead_text}\n</lead>"}
         ]
@@ -138,13 +148,13 @@ class Agent:
                     "refused",
                     "The model declined to process this enquiry.",
                 )
-                return result
+                return
             if response.stop_reason == "max_tokens":
                 result.outcome, result.summary = (
                     "max_tokens",
                     "The response was cut off at the token limit.",
                 )
-                return result
+                return
 
             tool_calls = [b for b in response.content if b.type == "tool_use"]
             if not tool_calls:
@@ -152,7 +162,7 @@ class Agent:
                 result.summary = "\n".join(
                     b.text for b in response.content if b.type == "text"
                 ).strip()
-                return result
+                return
 
             # Append the assistant turn unchanged (it may carry thinking blocks the
             # API needs back), then answer every tool call in a single user turn.
@@ -176,4 +186,4 @@ class Agent:
         # Circuit breaker: the model kept calling tools without finishing.
         result.summary = f"Stopped after {self._max_steps} steps without finishing. Check the ledger for partial writes."
         log.warning("run.step_limit", max_steps=self._max_steps)
-        return result
+        return
