@@ -74,6 +74,23 @@ uv run pytest
 uv run ruff check . && uv run mypy
 ```
 
+### Example run
+
+The enquiry above, run live against a HubSpot demo account with `MODEL=claude-haiku-5-5`:
+
+```
+  1. ✓ find_company(domain='mueller-baeckerei.de')            → {"matches": []}
+  2. ✓ find_contact(email='jonas.weber@mueller-baeckerei.de') → {"matches": []}
+  3. ✓ create_company(name='Müller Bäckerei', domain='mueller-baeckerei.de', city='Hamburg')
+  4. ✓ create_contact(firstname='Jonas', lastname='Weber', email=..., company_id=...)
+  5. ✓ create_deal(dealname='Müller Bäckerei – Solar flat roof (~400 m²)', amount_eur=60000, ...)
+
+run 9be2569b48fd · completed · 5 tool calls · 12615 tokens · $0.0016 · 14.6s
+```
+
+The deal landed in the default pipeline, linked to the company and the contact. That is one run, not
+a benchmark: cost and steps vary between runs, and the measured eval arrives in v0.3.
+
 ---
 
 ## Design decisions
