@@ -11,7 +11,9 @@ SQLite ledger, structlog, typer.
 - The model decides; code acts. Every tool input is validated by a pydantic model with `extra="forbid"`
   before any HTTP call. Never add a tool that bypasses `ToolBox.execute`.
 - The agent loop stays hand-written and step-capped. No agent frameworks.
-- Every CRM write is recorded in the ledger after HubSpot confirms it.
+- The agent never writes. Create tools record proposals; only `approval.Approver` writes, after a
+  human approves. Every CRM write is recorded in the ledger after HubSpot confirms it.
+- Record ids the model passes must come from tool results in the same run.
 - Lead text is untrusted: keep it inside `<lead>` tags; never give the model tools beyond the CRM ones.
 - Default test run: no network, no model spend. Live tests carry `@pytest.mark.live`.
 - Point only at a demo HubSpot account. Secrets live in `.env` (gitignored), never in code or logs.
