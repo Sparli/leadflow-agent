@@ -7,6 +7,10 @@ never reaches HubSpot. The validation error goes back to the model as an error
 result, and the model corrects itself on the next step.
 
 Prompt instructions are requests; this layer is enforcement.
+
+The find tools read HubSpot directly; reads change nothing. The create tools
+never write: they record a proposal and return a placeholder id. A human
+approves the plan and `approval.Approver` performs the writes.
 """
 
 from __future__ import annotations
@@ -22,13 +26,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from leadflow.errors import HubSpotError
 from leadflow.hubspot import HubSpotClient
-from leadflow.ledger import Ledger
+from leadflow.ledger import Ledger, Proposal
 
 log = structlog.get_logger(__name__)
 
 # Every record the agent creates carries this marker, so a person browsing
 # HubSpot can see at a glance which records came from the demo agent.
 DEMO_MARKER = "[leadflow demo]"
+
+CREATE_TOOLS = frozenset({"create_company", "create_contact", "create_deal"})
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _DOMAIN = re.compile(r"^(?!-)[a-z0-9-]+(\.[a-z0-9-]+)+$")
@@ -121,12 +127,15 @@ class _Tool:
 
 
 class ToolBox:
-    """Owns the tools for one run. Bound to a run_id so every write is attributable."""
+    """Owns the tools for one run. Bound to a run_id so every proposal is attributable."""
 
     def __init__(self, hubspot: HubSpotClient, ledger: Ledger, run_id: str) -> None:
         self._hubspot = hubspot
         self._ledger = ledger
         self._run_id = run_id
+        # Ids this run has legitimately seen, per object type: found by a search or
+        # returned as a placeholder by a proposal.
+        self._known: dict[str, set[str]] = {"companies": set(), "contacts": set()}
         self._tools = {
             t.name: t
             for t in (
@@ -144,19 +153,19 @@ class ToolBox:
                 ),
                 _Tool(
                     "create_company",
-                    "Create a company. Only if find_company found nothing.",
+                    "Propose creating a company. Only if find_company found nothing.",
                     CreateCompany,
                     self._create_company,
                 ),
                 _Tool(
                     "create_contact",
-                    "Create a contact, linked to its company. Only if find_contact found nothing.",
+                    "Propose creating a contact, linked to its company. Only if find_contact found nothing.",
                     CreateContact,
                     self._create_contact,
                 ),
                 _Tool(
                     "create_deal",
-                    "Create a sales deal for a company, linked to the contact.",
+                    "Propose creating a sales deal for a company, linked to the contact.",
                     CreateDeal,
                     self._create_deal,
                 ),
@@ -189,6 +198,8 @@ class ToolBox:
             return ToolResult(f"invalid input, nothing was written: {problems}", is_error=True)
         try:
             output = tool.handler(args)
+        except UnknownReferenceError as exc:
+            return ToolResult(f"invalid input, nothing was written: {exc}", is_error=True)
         except HubSpotError as exc:
             log.warning("tool.hubspot_error", tool=name, status=exc.status_code)
             return ToolResult(f"HubSpot error ({exc.status_code}): {exc}", is_error=True)
@@ -198,56 +209,55 @@ class ToolBox:
 
     def _find_company(self, args: FindCompany) -> dict[str, Any]:
         found = self._hubspot.search("companies", "domain", args.domain)
+        self._known["companies"].update(r["id"] for r in found)
         return {"matches": [{"id": r["id"], **r.get("properties", {})} for r in found]}
 
     def _find_contact(self, args: FindContact) -> dict[str, Any]:
         found = self._hubspot.search("contacts", "email", args.email)
+        self._known["contacts"].update(r["id"] for r in found)
         return {"matches": [{"id": r["id"], **r.get("properties", {})} for r in found]}
 
     def _create_company(self, args: CreateCompany) -> dict[str, Any]:
-        props = _props(name=args.name, domain=args.domain, city=args.city, description=DEMO_MARKER)
-        company_id = self._write("companies", props)
-        return {"company_id": company_id}
+        proposal = self._propose("create_company", args)
+        self._known["companies"].add(proposal.placeholder)
+        return {"company_id": proposal.placeholder, "status": _PROPOSED}
 
     def _create_contact(self, args: CreateContact) -> dict[str, Any]:
-        props = _props(
-            firstname=args.firstname, lastname=args.lastname, email=args.email, phone=args.phone
-        )
-        contact_id = self._write("contacts", props)
-        if args.company_id:
-            self._associate("contacts", contact_id, "companies", args.company_id)
-        return {"contact_id": contact_id}
+        self._require_known("companies", args.company_id)
+        proposal = self._propose("create_contact", args)
+        self._known["contacts"].add(proposal.placeholder)
+        return {"contact_id": proposal.placeholder, "status": _PROPOSED}
 
     def _create_deal(self, args: CreateDeal) -> dict[str, Any]:
-        description = DEMO_MARKER if not args.notes else f"{DEMO_MARKER} {args.notes}"
-        props = _props(
-            dealname=args.dealname,
-            amount=None if args.amount_eur is None else f"{args.amount_eur:.2f}",
-            pipeline="default",
-            dealstage="appointmentscheduled",
-            description=description,
-        )
-        deal_id = self._write("deals", props)
-        self._associate("deals", deal_id, "companies", args.company_id)
-        if args.contact_id:
-            self._associate("deals", deal_id, "contacts", args.contact_id)
-        return {"deal_id": deal_id}
+        self._require_known("companies", args.company_id)
+        self._require_known("contacts", args.contact_id)
+        if args.contact_id is None and self._known["contacts"]:
+            # Seen live: a model proposing contact and deal in one parallel step has no
+            # contact id yet, and the deal ends up linked to nobody.
+            raise UnknownReferenceError(
+                "this run has a contact "
+                f"({', '.join(sorted(self._known['contacts']))}); pass it as contact_id"
+            )
+        proposal = self._propose("create_deal", args)
+        return {"deal_id": proposal.placeholder, "status": _PROPOSED}
 
-    def _write(self, object_type: Any, props: dict[str, str]) -> str:
-        object_id = self._hubspot.create(object_type, props)
-        # Recorded only after HubSpot confirms, so the ledger never lists a
-        # record that does not exist.
-        self._ledger.record_write(self._run_id, object_type, object_id, "create", props)
-        log.info("tool.created", object_type=object_type, object_id=object_id)
-        return object_id
+    def _propose(self, tool: str, args: _ToolInput) -> Proposal:
+        proposal = self._ledger.add_proposal(self._run_id, tool, args.model_dump(exclude_none=True))
+        log.info("tool.proposed", tool=tool, proposal_id=proposal.id)
+        return proposal
 
-    def _associate(self, from_type: Any, from_id: str, to_type: Any, to_id: str) -> None:
-        self._hubspot.associate(from_type, from_id, to_type, to_id)
-        self._ledger.record_write(
-            self._run_id, from_type, from_id, "associate", {"to": to_type, "to_id": to_id}
-        )
+    def _require_known(self, object_type: str, object_id: str | None) -> None:
+        # Links may only point at records this run found or proposed. Without this,
+        # an id copied from the enquiry text could attach a deal to someone else's company.
+        if object_id is not None and object_id not in self._known[object_type]:
+            raise UnknownReferenceError(
+                f"{object_type} id {object_id!r} was not returned by a tool in this run; "
+                f"use an id from find_* or create_* results"
+            )
 
 
-def _props(**values: str | None) -> dict[str, str]:
-    """Drop unset fields: sending an empty string would overwrite real data on updates."""
-    return {k: v for k, v in values.items() if v is not None}
+_PROPOSED = "proposed; written to HubSpot only after a human approves. Use this id in later calls."
+
+
+class UnknownReferenceError(ValueError):
+    """The model referenced a record id it never received from a tool."""

@@ -1,4 +1,4 @@
-"""Tool input validation: bad arguments from the model never reach HubSpot."""
+"""Tools: bad arguments never reach HubSpot, and create tools only propose."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 
 from leadflow.errors import HubSpotError
 from leadflow.ledger import Ledger
-from leadflow.tools import DEMO_MARKER, ToolBox
+from leadflow.tools import ToolBox
 
 
 class FakeHubSpot:
@@ -21,6 +21,7 @@ class FakeHubSpot:
         self._search_results = search_results or []
         self._next_id = 100
         self.fail_with: HubSpotError | None = None
+        self.fail_associate: HubSpotError | None = None
 
     def search(self, object_type: str, prop: str, value: str) -> list[dict[str, Any]]:
         self.calls.append(("search", object_type, prop, value))
@@ -34,7 +35,12 @@ class FakeHubSpot:
         return str(self._next_id)
 
     def associate(self, from_type: str, from_id: str, to_type: str, to_id: str) -> None:
+        if self.fail_associate:
+            raise self.fail_associate
         self.calls.append(("associate", from_type, from_id, to_type, to_id))
+
+    def writes(self) -> list[tuple[str, ...]]:
+        return [c for c in self.calls if c[0] != "search"]
 
 
 @pytest.fixture
@@ -92,45 +98,76 @@ def test_domain_is_normalised(toolbox: ToolBox, hubspot: FakeHubSpot) -> None:
     assert hubspot.calls == [("search", "companies", "domain", "mueller-baeckerei.de")]
 
 
-def test_create_deal_writes_marker_links_records_and_ledger(
+def test_create_tools_propose_and_never_write(
     toolbox: ToolBox, hubspot: FakeHubSpot, ledger: Ledger
 ) -> None:
-    result = toolbox.execute(
+    company = json.loads(toolbox.execute("create_company", {"name": "Acme"}).content)
+    contact = json.loads(
+        toolbox.execute(
+            "create_contact", {"firstname": "Jonas", "company_id": company["company_id"]}
+        ).content
+    )
+    deal = toolbox.execute(
         "create_deal",
         {
-            "dealname": "Müller solar",
-            "company_id": "7",
-            "contact_id": "8",
+            "dealname": "Acme solar",
+            "company_id": company["company_id"],
+            "contact_id": contact["contact_id"],
             "amount_eur": 60000,
-            "notes": "400m2",
         },
     )
 
-    assert not result.is_error
-    deal_id = json.loads(result.content)["deal_id"]
-    created = json.loads(hubspot.calls[0][2])
-    assert created["amount"] == "60000.00"
-    assert created["description"].startswith(DEMO_MARKER)
-    assert ("associate", "deals", deal_id, "companies", "7") in hubspot.calls
-    assert ("associate", "deals", deal_id, "contacts", "8") in hubspot.calls
-    assert [r.object_id for r in ledger.created_records("run1")] == [deal_id]
+    assert not deal.is_error
+    assert company["company_id"].startswith("pending-")
+    assert hubspot.calls == []
+    assert ledger.created_records() == []
+    assert [p.tool for p in ledger.proposals("run1")] == [
+        "create_company",
+        "create_contact",
+        "create_deal",
+    ]
 
 
-def test_unset_fields_are_not_sent(toolbox: ToolBox, hubspot: FakeHubSpot) -> None:
-    toolbox.execute("create_contact", {"firstname": "Jonas"})
-    assert json.loads(hubspot.calls[0][2]) == {"firstname": "Jonas"}
-
-
-def test_hubspot_failure_becomes_error_result_and_nothing_is_ledgered(
-    toolbox: ToolBox, hubspot: FakeHubSpot, ledger: Ledger
-) -> None:
-    hubspot.fail_with = HubSpotError("conflict", status_code=409, retryable=False)
-
-    result = toolbox.execute("create_company", {"name": "Acme"})
+def test_links_must_point_at_ids_this_run_has_seen(toolbox: ToolBox, ledger: Ledger) -> None:
+    # An id the model never received, e.g. copied from the enquiry text.
+    result = toolbox.execute("create_deal", {"dealname": "x", "company_id": "999"})
 
     assert result.is_error
-    assert "409" in result.content
-    assert ledger.created_records() == []
+    assert "999" in result.content
+    assert ledger.proposals("run1") == []
+
+
+def test_deal_must_link_the_contact_this_run_has(toolbox: ToolBox) -> None:
+    company = json.loads(toolbox.execute("create_company", {"name": "Acme"}).content)
+    toolbox.execute("create_contact", {"firstname": "Anke", "company_id": company["company_id"]})
+
+    result = toolbox.execute(
+        "create_deal", {"dealname": "Acme solar", "company_id": company["company_id"]}
+    )
+
+    assert result.is_error
+    assert "contact_id" in result.content
+
+
+def test_found_ids_can_be_linked(ledger: Ledger) -> None:
+    hubspot = FakeHubSpot(search_results=[{"id": "42", "properties": {"domain": "acme.de"}}])
+    toolbox = ToolBox(hubspot, ledger, "run1")  # type: ignore[arg-type]
+    toolbox.execute("find_company", {"domain": "acme.de"})
+
+    result = toolbox.execute("create_contact", {"firstname": "Jonas", "company_id": "42"})
+
+    assert not result.is_error
+
+
+def test_search_failure_becomes_error_result(toolbox: ToolBox, hubspot: FakeHubSpot) -> None:
+    def broken(*_: Any) -> list[dict[str, Any]]:
+        raise HubSpotError("unavailable", status_code=503, retryable=True)
+
+    hubspot.search = broken  # type: ignore[method-assign,assignment]
+    result = toolbox.execute("find_company", {"domain": "acme.de"})
+
+    assert result.is_error
+    assert "503" in result.content
 
 
 def test_definitions_are_generated_from_input_models(toolbox: ToolBox) -> None:

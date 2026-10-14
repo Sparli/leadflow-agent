@@ -1,6 +1,6 @@
 [project]
 name = "leadflow-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "A tool-using agent that turns raw inbound sales enquiries into clean HubSpot records, with an audit ledger, cost tracking and a failure-mode test suite."
 readme = "README.md"
 requires-python = ">=3.13"
