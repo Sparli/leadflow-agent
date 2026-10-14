@@ -92,7 +92,9 @@ def test_happy_path_runs_tools_and_finishes(ledger: Ledger) -> None:
     assert [s.tool for s in result.steps] == ["find_company", "create_company"]
     assert result.usage.input_tokens == 3000
     assert result.usage.cost_usd == pytest.approx(3 * (1000 * 4 + 100 * 20) / 1e6)
-    assert len(ledger.created_records(result.run_id)) == 1
+    # The agent only proposes; nothing reaches HubSpot until approval.
+    assert hubspot.writes() == []
+    assert [p.tool for p in ledger.proposals(result.run_id)] == ["create_company"]
 
 
 def test_lead_is_wrapped_as_untrusted_data(ledger: Ledger) -> None:

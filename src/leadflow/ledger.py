@@ -5,6 +5,7 @@ Three questions this answers that HubSpot alone cannot:
 - Which records did the agent create? (one-command cleanup, never touching
   records a human made)
 - How much did each run cost? (cost per lead is a first-class number)
+- What is the agent waiting for a human to approve? (proposals)
 
 SQLite because it is a single file, needs no server, and is ACID. At this
 volume a database server would add operations work and no benefit.
@@ -41,7 +42,24 @@ CREATE TABLE IF NOT EXISTS writes (
     payload     TEXT NOT NULL,
     archived_at TEXT
 );
+-- A write the agent wants to make. Nothing reaches HubSpot until a human approves it.
+CREATE TABLE IF NOT EXISTS proposals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL REFERENCES runs(run_id),
+    created_at  TEXT NOT NULL,
+    tool        TEXT NOT NULL,
+    args        TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'executed', 'reused', 'rejected', 'failed')),
+    object_id   TEXT,
+    decided_at  TEXT,
+    error       TEXT
+);
 """
+
+# The id the model sees for a record that does not exist yet. It uses it in later
+# calls (a contact's company_id), and approval swaps it for the real HubSpot id.
+PLACEHOLDER_PREFIX = "pending-"
 
 
 @dataclass(frozen=True)
@@ -50,6 +68,21 @@ class WriteRecord:
     object_type: str
     object_id: str
     action: str
+
+
+@dataclass(frozen=True)
+class Proposal:
+    id: int
+    run_id: str
+    tool: str
+    args: dict[str, Any]
+    status: str
+    object_id: str | None
+    error: str | None
+
+    @property
+    def placeholder(self) -> str:
+        return f"{PLACEHOLDER_PREFIX}{self.id}"
 
 
 class Ledger:
@@ -130,6 +163,51 @@ class Ledger:
             (limit,),
         ).fetchall()
         return [tuple(r) for r in rows]
+
+    def add_proposal(self, run_id: str, tool: str, args: dict[str, Any]) -> Proposal:
+        with self._db:
+            cur = self._db.execute(
+                "INSERT INTO proposals (run_id, created_at, tool, args) VALUES (?, ?, ?, ?)",
+                (run_id, _now(), tool, json.dumps(args, sort_keys=True)),
+            )
+        return Proposal(cur.lastrowid or 0, run_id, tool, args, "pending", None, None)
+
+    def proposals(self, run_id: str) -> list[Proposal]:
+        """Every proposal for a run, in the order the agent made them.
+
+        Order matters: a contact proposal can point at a company proposal, so
+        approval must execute them in the same order.
+        """
+        rows = self._db.execute(
+            "SELECT id, run_id, tool, args, status, object_id, error FROM proposals "
+            "WHERE run_id=? ORDER BY id",
+            (run_id,),
+        ).fetchall()
+        return [Proposal(r[0], r[1], r[2], json.loads(r[3]), r[4], r[5], r[6]) for r in rows]
+
+    def decide(
+        self,
+        proposal_id: int,
+        status: str,
+        *,
+        object_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._db:
+            self._db.execute(
+                # COALESCE: once a record exists in HubSpot its id is never forgotten,
+                # or a retry would create the record a second time.
+                "UPDATE proposals SET status=?, object_id=COALESCE(?, object_id), error=?, "
+                "decided_at=? WHERE id=?",
+                (status, object_id, error, _now(), proposal_id),
+            )
+
+    def pending_counts(self) -> dict[str, int]:
+        rows = self._db.execute(
+            "SELECT run_id, COUNT(*) FROM proposals WHERE status IN ('pending', 'failed') "
+            "GROUP BY run_id"
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
 
     def close(self) -> None:
         self._db.close()
