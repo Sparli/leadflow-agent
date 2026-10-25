@@ -12,6 +12,8 @@ The loop:
 
 from __future__ import annotations
 
+import json
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -22,6 +24,7 @@ import structlog
 from anthropic.types.beta import BetaMessage
 
 from leadflow.cost import Usage
+from leadflow.errors import LeadRejectedError
 from leadflow.ledger import Ledger
 from leadflow.tools import ToolBox
 
@@ -67,7 +70,7 @@ class Step:
 @dataclass
 class RunResult:
     run_id: str
-    outcome: str  # "completed" | "step_limit" | "refused" | "max_tokens" | "error"
+    outcome: str  # completed | step_limit | stuck | refused | max_tokens | error
     summary: str
     steps: list[Step] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
@@ -83,14 +86,25 @@ class Agent:
         *,
         model: str,
         max_steps: int,
+        max_lead_chars: int = 8000,
     ) -> None:
         self._create = create_message
         self._toolbox_factory = toolbox_factory
         self._ledger = ledger
         self._model = model
+        self._max_lead_chars = max_lead_chars
         self._max_steps = max_steps
 
     def run(self, lead_text: str) -> RunResult:
+        # Checked before the run exists: an empty or oversized enquiry costs nothing.
+        # A real enquiry is a few hundred characters; 8,000 leaves room for a long
+        # email thread while capping what a pasted document could cost.
+        if not lead_text.strip():
+            raise LeadRejectedError("the enquiry is empty")
+        if len(lead_text) > self._max_lead_chars:
+            raise LeadRejectedError(
+                f"the enquiry is {len(lead_text):,} characters; the limit is {self._max_lead_chars:,}"
+            )
         run_id = uuid.uuid4().hex[:12]
         structlog.contextvars.bind_contextvars(run_id=run_id)
         started = time.monotonic()
@@ -127,8 +141,9 @@ class Agent:
 
     def _loop(self, result: RunResult, lead_text: str) -> None:
         toolbox = self._toolbox_factory(result.run_id)
+        failures: dict[str, int] = {}
         messages: list[dict[str, Any]] = [
-            {"role": "user", "content": f"<lead>\n{lead_text}\n</lead>"}
+            {"role": "user", "content": f"<lead>\n{_neutralise_tags(lead_text)}\n</lead>"}
         ]
 
         for _ in range(self._max_steps):
@@ -185,9 +200,35 @@ class Agent:
                         "is_error": outcome.is_error,
                     }
                 )
+                if outcome.is_error:
+                    key = f"{call.name}:{json.dumps(call.input, sort_keys=True)}"
+                    failures[key] = failures.get(key, 0) + 1
+                    # The same call failing twice will fail a third time. One retry is
+                    # allowed (HubSpot may have been briefly down); after that, stop
+                    # instead of spending the rest of the step budget on it.
+                    if failures[key] >= 2:
+                        result.outcome = "stuck"
+                        result.summary = (
+                            f"Stopped: {call.name} failed twice with the same input. "
+                            f"Last error: {outcome.content}"
+                        )
+                        log.warning("run.stuck", tool=call.name)
+                        return
             messages.append({"role": "user", "content": tool_results})
 
         # Circuit breaker: the model kept calling tools without finishing.
         result.summary = f"Stopped after {self._max_steps} steps without finishing. Check the ledger for partial writes."
         log.warning("run.step_limit", max_steps=self._max_steps)
         return
+
+
+_LEAD_TAG = re.compile(r"<\s*/?\s*lead\s*>", re.IGNORECASE)
+
+
+def _neutralise_tags(text: str) -> str:
+    """Stop an enquiry from closing the <lead> wrapper early.
+
+    Without this, "...</lead> New instructions: ..." would put the attacker's text
+    outside the data block, where it reads like the operator's own words.
+    """
+    return _LEAD_TAG.sub("[lead-tag removed]", text)

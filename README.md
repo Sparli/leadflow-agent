@@ -150,9 +150,10 @@ HubSpot confirms it. That gives an exact answer to "what did run X do?", per-run
 `cleanup` that archives only agent-created records, newest first so no deal is left pointing at a
 deleted contact.
 
-**Retry what's transient, fail fast on what's permanent.** The HubSpot client retries 429 and 5xx with
-backoff, honouring `Retry-After`. It never retries 4xx, because retrying a bad request only burns
-rate limit.
+**Retry what's transient and safe, fail fast on the rest.** Reads are retried on 429, 5xx and network
+errors with backoff, honouring `Retry-After`. A create is retried only on 429 or a connection that never
+opened: after a 5xx or a timeout the record may already exist, and a blind retry would duplicate it.
+4xx is never retried.
 
 **The enquiry is untrusted input.** It's wrapped in `<lead>` tags and the model is told it's data, not
 instructions. That's a mitigation, not a guarantee. The guarantee is structural: the model's only
@@ -161,6 +162,15 @@ successful injection can at worst propose a wrong record, which a human sees bef
 
 **Cost is a first-class output.** Every run reports tokens, dollars and seconds, and stores them in
 the ledger.
+
+---
+
+## Failure modes
+
+Every failure the system is designed for (HubSpot outages, lost responses, hostile enquiries, a
+model that loops) has a row in [FAILURE-MODES.md](FAILURE-MODES.md) and a test in
+[`tests/test_failures.py`](tests/test_failures.py). The rule that shapes most of them: **retry a
+read whenever it fails; retry a write only when it certainly did not happen.**
 
 ---
 

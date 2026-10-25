@@ -16,7 +16,7 @@ import typer
 from leadflow.agent import Agent, RunResult
 from leadflow.approval import Approver, Outcome
 from leadflow.config import Settings, load_settings
-from leadflow.errors import ConfigError, HubSpotError
+from leadflow.errors import ConfigError, HubSpotError, LeadRejectedError
 from leadflow.hubspot import HubSpotClient
 from leadflow.ledger import Ledger, Proposal
 from leadflow.logging import configure_logging
@@ -43,7 +43,13 @@ def run(
         else None
     )
     client = anthropic.Anthropic(
-        api_key=settings.anthropic_api_key.get_secret_value(), default_headers=headers
+        api_key=settings.anthropic_api_key.get_secret_value(),
+        default_headers=headers,
+        # The SDK default waits up to 10 minutes per request. One step of this
+        # agent takes seconds; a minute means something is wrong. The SDK retries
+        # 429/5xx itself, with backoff.
+        timeout=60.0,
+        max_retries=2,
     )
     agent = Agent(
         client.beta.messages.create,
@@ -51,9 +57,13 @@ def run(
         ledger,
         model=settings.model,
         max_steps=settings.max_agent_steps,
+        max_lead_chars=settings.max_lead_chars,
     )
     try:
         result = agent.run(text)
+    except LeadRejectedError as exc:
+        typer.echo(f"enquiry rejected: {exc}", err=True)
+        raise typer.Exit(2) from exc
     except anthropic.APIStatusError as exc:
         typer.echo(f"model API error ({exc.status_code}): {exc.message}", err=True)
         raise typer.Exit(1) from exc

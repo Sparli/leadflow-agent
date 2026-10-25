@@ -53,7 +53,10 @@ class HubSpotClient:
             "properties": _DEFAULT_PROPERTIES[object_type],
             "limit": 5,
         }
-        data = self._request("POST", f"/crm/v3/objects/{object_type}/search", json=body)
+        # A search is a POST but changes nothing, so it is safe to retry.
+        data = self._request(
+            "POST", f"/crm/v3/objects/{object_type}/search", json=body, idempotent=True
+        )
         results: list[dict[str, Any]] = data.get("results", [])
         return results
 
@@ -61,6 +64,14 @@ class HubSpotClient:
         data = self._request(
             "POST", f"/crm/v3/objects/{object_type}", json={"properties": properties}
         )
+        if "id" not in data:
+            # The record may exist, so this is not retryable: approval's duplicate
+            # re-check is the safe way to recover.
+            raise HubSpotError(
+                f"create {object_type}: success response without an id",
+                status_code=None,
+                retryable=False,
+            )
         return str(data["id"])
 
     def associate(
@@ -69,29 +80,45 @@ class HubSpotClient:
         # The "default" association endpoint picks HubSpot's standard label, so the
         # code never hard-codes numeric association type IDs.
         self._request(
-            "PUT", f"/crm/v4/objects/{from_type}/{from_id}/associations/default/{to_type}/{to_id}"
+            "PUT",
+            f"/crm/v4/objects/{from_type}/{from_id}/associations/default/{to_type}/{to_id}",
+            idempotent=True,
         )
 
     def archive(self, object_type: ObjectType, object_id: str) -> None:
         """Move a record to HubSpot's recycle bin (recoverable for 90 days)."""
-        self._request("DELETE", f"/crm/v3/objects/{object_type}/{object_id}")
+        self._request("DELETE", f"/crm/v3/objects/{object_type}/{object_id}", idempotent=True)
 
-    def _request(self, method: str, path: str, *, json: Any = None) -> dict[str, Any]:
+    def _request(
+        self, method: str, path: str, *, json: Any = None, idempotent: bool = False
+    ) -> dict[str, Any]:
+        """Send a request, retrying only what is safe to retry.
+
+        A non-idempotent write (creating a record) is retried only when HubSpot
+        certainly did not perform it: a 429, or a connection that never opened.
+        After a read timeout or a 5xx the record may already exist, and a blind
+        retry would create a duplicate.
+        """
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
                 response = self._http.request(method, path, json=json)
             except httpx.TransportError as exc:
-                if attempt == _MAX_ATTEMPTS:
+                never_sent = isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout)
+                if attempt == _MAX_ATTEMPTS or not (idempotent or never_sent):
                     raise HubSpotError(
-                        f"network error: {exc}", status_code=None, retryable=True
+                        f"network error: {exc}",
+                        status_code=None,
+                        retryable=idempotent or never_sent,
                     ) from exc
                 self._backoff(attempt, retry_after=None)
                 continue
 
             if response.status_code < 400:
-                return response.json() if response.content else {}
+                return _parse(response, method, path)
 
-            retryable = response.status_code in _RETRYABLE
+            retryable = response.status_code in _RETRYABLE and (
+                idempotent or response.status_code == 429
+            )
             if not retryable or attempt == _MAX_ATTEMPTS:
                 raise HubSpotError(
                     f"{method} {path} -> {response.status_code}: {_error_message(response)}",
@@ -114,6 +141,26 @@ class HubSpotClient:
             else:
                 return
         self._sleep(min(2**attempt, 16) * (0.5 + random.random()))  # noqa: S311 - jitter, not crypto
+
+
+def _parse(response: httpx.Response, method: str, path: str) -> dict[str, Any]:
+    if not response.content:
+        return {}
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HubSpotError(
+            f"{method} {path}: success status but the body is not JSON",
+            status_code=response.status_code,
+            retryable=False,
+        ) from exc
+    if not isinstance(data, dict):
+        raise HubSpotError(
+            f"{method} {path}: expected a JSON object",
+            status_code=response.status_code,
+            retryable=False,
+        )
+    return data
 
 
 def _error_message(response: httpx.Response) -> str:
