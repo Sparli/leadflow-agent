@@ -44,12 +44,10 @@ def test_rate_limit_is_retried_honouring_retry_after(
 
 
 @respx.mock
-def test_server_errors_give_up_after_max_attempts(
-    client: HubSpotClient, sleeps: list[float]
-) -> None:
-    respx.post(f"{BASE}/crm/v3/objects/deals").respond(503, json={"message": "unavailable"})
+def test_reads_retry_server_errors_then_give_up(client: HubSpotClient, sleeps: list[float]) -> None:
+    respx.post(f"{BASE}/crm/v3/objects/deals/search").respond(503, json={"message": "unavailable"})
     with pytest.raises(HubSpotError) as exc:
-        client.create("deals", {"dealname": "x"})
+        client.search("deals", "dealname", "x")
     assert exc.value.status_code == 503
     assert exc.value.retryable
     assert len(sleeps) == 3  # four attempts, three waits
