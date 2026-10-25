@@ -28,3 +28,7 @@ class HubSpotError(LeadflowError):
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+
+
+class LeadRejectedError(LeadflowError):
+    """The enquiry cannot be processed as given (empty or too long). Raised before any model call."""

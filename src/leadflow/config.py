@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # three creates, a final answer); twelve leaves room for a corrected tool
     # input or two without letting a confused run spend indefinitely.
     max_agent_steps: int = Field(default=12, ge=1, le=50)
+    max_lead_chars: int = Field(default=8000, ge=100, le=100_000)
 
     ledger_path: Path = Path(".leadflow/ledger.sqlite3")
 
